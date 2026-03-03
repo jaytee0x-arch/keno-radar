@@ -1,0 +1,62 @@
+name: Keno Radar
+
+on:
+  schedule:
+    # Check for trigger email every 30 minutes
+    - cron: '*/30 * * * *'
+  workflow_dispatch:  # Also allows manual triggering from GitHub
+
+permissions:
+  contents: write
+
+jobs:
+  radar:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Check for trigger email
+        id: check
+        env:
+          EMAIL_SENDER: ${{ secrets.EMAIL_SENDER }}
+          EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
+        run: |
+          python check_trigger.py
+          echo "triggered=$(cat .trigger)" >> $GITHUB_OUTPUT
+
+      # Everything below ONLY runs if a trigger email was found
+      - name: Install Python dependencies
+        if: steps.check.outputs.triggered == 'true'
+        run: pip install -r requirements.txt
+
+      - name: Install Playwright browsers
+        if: steps.check.outputs.triggered == 'true'
+        run: playwright install chromium --with-deps
+
+      - name: Run scraper (fetch latest 15 games)
+        if: steps.check.outputs.triggered == 'true'
+        run: python scraper.py
+
+      - name: Generate radar GIF and send email
+        if: steps.check.outputs.triggered == 'true'
+        env:
+          EMAIL_SENDER: ${{ secrets.EMAIL_SENDER }}
+          EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
+          EMAIL_RECIPIENT: ${{ secrets.EMAIL_RECIPIENT }}
+        run: python radar.py
+
+      - name: Save GIF to repository
+        if: steps.check.outputs.triggered == 'true'
+        run: |
+          git config --global user.name "KenoBot"
+          git config --global user.email "kenobot@users.noreply.github.com"
+          git add keno_radar.gif games.csv || true
+          git commit -m "Radar generated: $(date -u '+%Y-%m-%d %H:%M UTC')" || true
+          git push || true
