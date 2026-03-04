@@ -17,8 +17,10 @@ from email import encoders
 # ==============================================================================
 GAMES_FILE = "games.csv"
 GIF_FILE = "keno_radar.gif"
-FRAME_DURATION_MS = 800     # Slower so you can study each intersection
-HOLD_LAST_FRAME_MS = 3000   # Hold the final surviving numbers longer
+FRAME_DURATION_MS = 700
+HOLD_LAST_FRAME_MS = 3000
+STARTING_LIVES = 2      # Each number begins with this many lives
+# No max cap — lives accumulate freely each run, reset on next trigger
 
 EMAIL_SENDER = os.environ.get("EMAIL_SENDER", "")
 EMAIL_PASSWORD = os.environ.get("EMAIL_PASSWORD", "")
@@ -34,40 +36,114 @@ BOARD_COLS = 10
 
 
 # ==============================================================================
-# FRAME GENERATOR
-# Each frame shows the running intersection of all games seen so far.
-# A number stays lit only if it appeared in EVERY game up to this frame.
-# New arrivals in the current game flash bright white.
-# Survivors from previous frames glow steady cyan.
-# Eliminated numbers drop to near-invisible dark navy.
+# LIFE SIMULATION
+# Runs through all frames and returns a list of dicts, one per frame.
+# Each dict maps number -> lives at that point in time.
 # ==============================================================================
-def generate_frame(games_data, frame_idx):
-    total_frames = len(games_data)
+def simulate_lives(games_data):
+    """
+    For each frame, compute every number's current life count.
+    Rules:
+      - All 80 numbers start with STARTING_LIVES
+      - Drawn in a game: +1 life
+      - Not drawn in a game: -1 life
+      - Lives floor at 0 (dead = invisible)
+      - No maximum cap
+    """
+    snapshots = []
+    lives = {n: STARTING_LIVES for n in range(1, 81)}
 
-    # --- Calculate the running intersection ---
-    # survivors = numbers that appeared in ALL games from 0 to frame_idx
-    survivors = games_data[0]["numbers"].copy()
-    for i in range(1, frame_idx + 1):
-        survivors = survivors & games_data[i]["numbers"]
+    for game in games_data:
+        drawn = game["numbers"]
+        for n in range(1, 81):
+            if n in drawn:
+                lives[n] += 1
+            else:
+                lives[n] = max(0, lives[n] - 1)
+        # Store a copy of the current state
+        snapshots.append(dict(lives))
 
-    # Numbers in the current game's draw (before intersection filter)
-    current_draw = games_data[frame_idx]["numbers"]
+    return snapshots
 
-    # Numbers that are new candidates this frame (in current draw AND surviving)
-    # vs numbers that were already survivors before this frame
-    if frame_idx == 0:
-        previous_survivors = set()
+
+# ==============================================================================
+# VISUAL STYLE based on life count
+# 0 lives  = completely dark / invisible
+# 1 life   = dim, small
+# 2 lives  = medium blue-white
+# 3 lives  = bright white
+# 4 lives  = bright white + glow
+# 5+ lives = blazing white/cyan + strong glow
+# ==============================================================================
+def get_visual(lives, just_drawn):
+    """
+    Returns (bg, text_col, edge, fontsize, fontweight, glow_col, glow_alpha)
+    just_drawn = True if this number was in the current game's draw
+    """
+    if lives == 0:
+        return "#060610", "#0f0f22", "#080818", 8.0, "normal", None, 0.0
+
+    # Brightness increases with lives
+    # Interpolate from dim navy (1 life) to bright white (high lives)
+    brightness = min(1.0, (lives - 1) / 5.0)  # Saturates at 6 lives
+
+    r = int(20  + brightness * (255 - 20))
+    g = int(30  + brightness * (255 - 30))
+    b = int(80  + brightness * (255 - 80))
+    bg = f"#{r:02x}{g:02x}{b:02x}"
+
+    # Text color flips from light to dark as background gets bright
+    if brightness > 0.6:
+        text_col = "#000000"
+    elif brightness > 0.3:
+        text_col = "#ccddff"
     else:
-        previous_survivors = games_data[0]["numbers"].copy()
-        for i in range(1, frame_idx):
-            previous_survivors = previous_survivors & games_data[i]["numbers"]
+        text_col = "#7788bb"
 
-    # Classify each number into a display state
-    # "fresh"    = in current draw, is a survivor, wasn't a survivor before
-    # "survivor" = was already a survivor and still is
-    # "current"  = in current draw but not a survivor (will be eliminated next frame)
-    # "dead"     = was in previous survivors but eliminated this frame
-    # "cold"     = never appeared in the survivor set
+    # Edge color
+    er = min(255, r + 30)
+    eg = min(255, g + 30)
+    eb = min(255, b + 20)
+    edge = f"#{er:02x}{eg:02x}{eb:02x}"
+
+    # Font size grows with lives
+    fontsize = 8.0 + min(lives - 1, 7) * 1.2   # 8pt at 1 life → ~16pt at 8+ lives
+    fontweight = "bold" if lives >= 3 else "normal"
+
+    # Glow: only for numbers with 3+ lives, stronger if just drawn
+    if lives >= 5:
+        glow_col = "#00ffff"
+        glow_alpha = 0.8 if just_drawn else 0.5
+    elif lives >= 3:
+        glow_col = "#ffffff"
+        glow_alpha = 0.6 if just_drawn else 0.3
+    elif just_drawn:
+        glow_col = "#8899ff"
+        glow_alpha = 0.3
+    else:
+        glow_col = None
+        glow_alpha = 0.0
+
+    return bg, text_col, edge, fontsize, fontweight, glow_col, glow_alpha
+
+
+# ==============================================================================
+# FRAME GENERATOR
+# ==============================================================================
+def generate_frame(games_data, frame_idx, snapshots):
+    total_frames = len(games_data)
+    game = games_data[frame_idx]
+    current_draw = game["numbers"]
+    current_lives = snapshots[frame_idx]
+
+    # Stats for the legend
+    alive = sum(1 for n in range(1, 81) if current_lives[n] > 0)
+    max_lives = max(current_lives.values())
+    top_numbers = sorted(
+        [n for n in range(1, 81) if current_lives[n] > 0],
+        key=lambda n: current_lives[n],
+        reverse=True
+    )[:5]
 
     fig = plt.figure(figsize=(13, 9))
     fig.patch.set_facecolor("#060610")
@@ -86,69 +162,12 @@ def generate_frame(games_data, frame_idx):
         cx = col
         cy = display_row
 
-        in_current = n in current_draw
-        is_survivor = n in survivors
-        was_survivor = n in previous_survivors
+        lives = current_lives[n]
+        just_drawn = n in current_draw
 
-        if frame_idx == 0:
-            # First frame: show all 20 drawn numbers equally bright
-            if in_current:
-                bg = "#ffffff"
-                text_col = "#000000"
-                edge = "#ffffff"
-                glow_col = "#ffffff"
-                do_glow = True
-                fontweight = "bold"
-            else:
-                bg = "#080820"
-                text_col = "#1a1a40"
-                edge = "#0f0f30"
-                do_glow = False
-                fontweight = "normal"
+        bg, text_col, edge, fontsize, fontweight, glow_col, glow_alpha = get_visual(lives, just_drawn)
 
-        else:
-            if is_survivor and was_survivor:
-                # Long-term survivor — steady bright cyan
-                bg = "#00ddff"
-                text_col = "#000000"
-                edge = "#00ffff"
-                glow_col = "#00ffff"
-                do_glow = True
-                fontweight = "bold"
-
-            elif is_survivor and not was_survivor:
-                # Newly confirmed survivor this frame — flash white
-                bg = "#ffffff"
-                text_col = "#000000"
-                edge = "#ffffff"
-                glow_col = "#ffffff"
-                do_glow = True
-                fontweight = "bold"
-
-            elif in_current and not is_survivor:
-                # In current draw but not a survivor — dim white, will die next frame
-                bg = "#555566"
-                text_col = "#aaaacc"
-                edge = "#444455"
-                do_glow = False
-                fontweight = "normal"
-
-            elif was_survivor and not is_survivor:
-                # Just got eliminated — show as faded red briefly
-                bg = "#331122"
-                text_col = "#553344"
-                edge = "#221122"
-                do_glow = False
-                fontweight = "normal"
-
-            else:
-                # Cold — never in the running
-                bg = "#080820"
-                text_col = "#1a1a40"
-                edge = "#0f0f30"
-                do_glow = False
-                fontweight = "normal"
-
+        # Cell background
         rect = patches.FancyBboxPatch(
             (cx + 0.06, cy + 0.06), 0.88, 0.88,
             boxstyle="round,pad=0.04",
@@ -159,27 +178,30 @@ def generate_frame(games_data, frame_idx):
         )
         ax.add_patch(rect)
 
-        if do_glow:
+        # Glow ring
+        if glow_col and glow_alpha > 0:
             glow = patches.FancyBboxPatch(
                 (cx + 0.02, cy + 0.02), 0.96, 0.96,
                 boxstyle="round,pad=0.06",
                 facecolor="none",
                 edgecolor=glow_col,
                 linewidth=2.5,
-                alpha=0.5,
+                alpha=glow_alpha,
                 zorder=1
             )
             ax.add_patch(glow)
 
-        fontsize = 9.5 if n >= 10 else 10.5
-        ax.text(
-            cx + 0.5, cy + 0.5, str(n),
-            ha="center", va="center",
-            color=text_col,
-            fontsize=fontsize,
-            fontweight=fontweight,
-            zorder=3
-        )
+        # Number label — scaled by lives
+        if lives > 0:
+            ax.text(
+                cx + 0.5, cy + 0.5, str(n),
+                ha="center", va="center",
+                color=text_col,
+                fontsize=fontsize,
+                fontweight=fontweight,
+                zorder=3,
+                clip_on=True
+            )
 
     # Row labels
     for r in range(BOARD_ROWS):
@@ -188,7 +210,7 @@ def generate_frame(games_data, frame_idx):
             -0.05, display_row + 0.5,
             f"{r*10+1}-{r*10+10}",
             ha="right", va="center",
-            color="#222244", fontsize=6.5
+            color="#1a1a3a", fontsize=6.5
         )
 
     # -----------------------------------------------------------------------
@@ -199,98 +221,123 @@ def generate_frame(games_data, frame_idx):
     ax_leg.axis("off")
 
     ax_leg.text(
-        0.5, 0.97, "LEGEND",
+        0.5, 0.97, "LIFE SYSTEM",
         ha="center", va="top",
         color="#aaaacc", fontsize=9, fontweight="bold",
         transform=ax_leg.transAxes
     )
 
-    legend_items = [
-        ("#ffffff", "#000000", "Current draw (frame 1)"),
-        ("#00ddff", "#000000", "Surviving (in all games)"),
-        ("#555566", "#aaaacc", "In draw, not a survivor"),
-        ("#331122", "#553344", "Just eliminated"),
-        ("#080820", "#1a1a40",  "Never drawn"),
+    # Visual scale guide
+    scale_labels = [
+        (1, "1 life  — dim"),
+        (2, "2 lives — medium"),
+        (3, "3 lives — bright"),
+        (5, "5 lives — blazing"),
+        (8, "8 lives — champion"),
     ]
-
-    y = 0.88
-    for bg, tc, label in legend_items:
+    y = 0.89
+    for sample_lives, label in scale_labels:
+        bg, tc, edge, fs, fw, gc, ga = get_visual(sample_lives, False)
         rect = patches.FancyBboxPatch(
-            (0.05, y - 0.03), 0.18, 0.055,
+            (0.05, y - 0.032), 0.18, 0.055,
             boxstyle="round,pad=0.01",
-            facecolor=bg,
-            edgecolor="#333355",
+            facecolor=bg, edgecolor=edge,
             linewidth=0.5,
             transform=ax_leg.transAxes
         )
         ax_leg.add_patch(rect)
+        if gc and ga > 0:
+            glow_rect = patches.FancyBboxPatch(
+                (0.04, y - 0.038), 0.20, 0.065,
+                boxstyle="round,pad=0.01",
+                facecolor="none", edgecolor=gc,
+                linewidth=1.5, alpha=ga * 0.6,
+                transform=ax_leg.transAxes
+            )
+            ax_leg.add_patch(glow_rect)
         ax_leg.text(
-            0.30, y - 0.002, label,
+            0.30, y - 0.005, label,
             ha="left", va="center",
             color="#ccccdd", fontsize=7,
             transform=ax_leg.transAxes
         )
-        y -= 0.10
+        y -= 0.095
 
-    # Survivor count
-    survivor_count = len(survivors)
+    # Separator
+    ax_leg.axhline(y - 0.01, xmin=0.05, xmax=0.95,
+                   color="#1a1a3a", linewidth=0.8,
+                   transform=ax_leg.transAxes)
+
+    # Live stats
     ax_leg.text(
-        0.5, 0.42, f"{survivor_count}",
-        ha="center", va="center",
-        color="#00ddff" if survivor_count > 0 else "#553344",
-        fontsize=36, fontweight="bold",
-        transform=ax_leg.transAxes
-    )
-    ax_leg.text(
-        0.5, 0.30,
-        "number(s)\nstill alive" if survivor_count > 0 else "no\nsurvivors",
+        0.5, y - 0.03,
+        f"{alive}  numbers alive",
         ha="center", va="center",
         color="#aaaacc", fontsize=8,
         transform=ax_leg.transAxes
     )
+    ax_leg.text(
+        0.5, y - 0.08,
+        f"Peak: {max_lives} lives",
+        ha="center", va="center",
+        color="#00ffff" if max_lives >= 5 else "#ffffff",
+        fontsize=9, fontweight="bold",
+        transform=ax_leg.transAxes
+    )
 
-    # Surviving numbers list
-    if survivors:
-        nums_str = "  ".join(str(n) for n in sorted(survivors))
+    # Top 5 strongest numbers
+    ax_leg.text(
+        0.5, y - 0.14,
+        "STRONGEST:",
+        ha="center", va="center",
+        color="#888899", fontsize=7, fontweight="bold",
+        transform=ax_leg.transAxes
+    )
+    for i, n in enumerate(top_numbers):
+        lv = current_lives[n]
+        _, _, _, fs, fw, gc, _ = get_visual(lv, False)
+        col = "#00ffff" if lv >= 5 else "#ffffff"
         ax_leg.text(
-            0.5, 0.20, nums_str,
+            0.5, y - 0.19 - i * 0.055,
+            f"{n}  ({'♥' * min(lv, 6)}{'…' if lv > 6 else ''}  {lv} lives)",
             ha="center", va="center",
-            color="#00ffff", fontsize=8, fontweight="bold",
+            color=col, fontsize=7.5,
             fontfamily="monospace",
             transform=ax_leg.transAxes
         )
 
-    # Current draw numbers
-    game = games_data[frame_idx]
-    current_nums = sorted(game["numbers"])
-    nums_line1 = "  ".join(str(n) for n in current_nums[:10])
-    nums_line2 = "  ".join(str(n) for n in current_nums[10:])
+    # Current draw
     ax_leg.text(
-        0.5, 0.11, "THIS DRAW:",
+        0.5, 0.09, "THIS DRAW:",
         ha="center", va="bottom",
-        color="#888899", fontsize=7, fontweight="bold",
+        color="#555566", fontsize=7, fontweight="bold",
         transform=ax_leg.transAxes
     )
+    nums = sorted(current_draw)
+    line1 = "  ".join(str(n) for n in nums[:10])
+    line2 = "  ".join(str(n) for n in nums[10:])
     ax_leg.text(
-        0.5, 0.07, nums_line1,
+        0.5, 0.06, line1,
         ha="center", va="top",
-        color="#666677", fontsize=6.5, fontfamily="monospace",
+        color="#444455", fontsize=6.5,
+        fontfamily="monospace",
         transform=ax_leg.transAxes
     )
-    if nums_line2:
+    if line2:
         ax_leg.text(
-            0.5, 0.03, nums_line2,
+            0.5, 0.02, line2,
             ha="center", va="top",
-            color="#666677", fontsize=6.5, fontfamily="monospace",
+            color="#444455", fontsize=6.5,
+            fontfamily="monospace",
             transform=ax_leg.transAxes
         )
 
     # -----------------------------------------------------------------------
-    # Title
+    # Title and progress bar
     # -----------------------------------------------------------------------
     fig.text(
         0.5, 0.975,
-        "GVR Green Game  —  Keno Survival Filter",
+        "GVR Green Game  —  Keno Life System",
         ha="center", va="top",
         color="white", fontsize=14, fontweight="bold"
     )
@@ -301,22 +348,20 @@ def generate_frame(games_data, frame_idx):
         color="#aaaacc", fontsize=9
     )
 
-    # Progress bar
     ax_bar = fig.add_axes([0.02, 0.045, 0.72, 0.018])
     ax_bar.set_facecolor("#0f0f28")
     ax_bar.set_xlim(0, total_frames)
     ax_bar.set_ylim(0, 1)
     ax_bar.axis("off")
-    ax_bar.barh(0.5, frame_idx + 1, height=1.0,
-                color="#00ddff" if survivor_count > 0 else "#553344",
-                alpha=0.5)
+    bar_color = "#00ffff" if max_lives >= 5 else "#4466ff"
+    ax_bar.barh(0.5, frame_idx + 1, height=1.0, color=bar_color, alpha=0.4)
     for i in range(total_frames):
         ax_bar.axvline(i + 0.5, color="#1a1a3a", linewidth=0.5)
     ax_bar.text(
         total_frames / 2, 0.5,
-        f"Game {frame_idx + 1} of {total_frames}  —  {survivor_count} survivor(s)",
+        f"Round {frame_idx + 1} of {total_frames}  —  {alive} alive  |  peak {max_lives} lives",
         ha="center", va="center",
-        color="#555577", fontsize=6.5
+        color="#444466", fontsize=6.5
     )
 
     buf = io.BytesIO()
@@ -333,11 +378,14 @@ def generate_frame(games_data, frame_idx):
 # GIF COMPILER
 # ==============================================================================
 def generate_radar_gif(games_data):
-    print(f"[Radar] Generating {len(games_data)}-frame survival filter animation...")
+    print(f"[Radar] Simulating life system across {len(games_data)} games...")
+    snapshots = simulate_lives(games_data)
+
+    print(f"[Radar] Generating {len(games_data)}-frame animation...")
     frames = []
     for i in range(len(games_data)):
         print(f"[Radar] Rendering frame {i + 1} of {len(games_data)}...")
-        frames.append(generate_frame(games_data, i))
+        frames.append(generate_frame(games_data, i, snapshots))
 
     durations = [FRAME_DURATION_MS] * len(frames)
     durations[-1] = HOLD_LAST_FRAME_MS
@@ -362,7 +410,7 @@ def generate_radar_gif(games_data):
 # ==============================================================================
 # EMAIL
 # ==============================================================================
-def send_radar_email(gif_bytes, games_data):
+def send_radar_email(gif_bytes, games_data, snapshots):
     if not all([EMAIL_SENDER, EMAIL_PASSWORD, EMAIL_RECIPIENT]):
         print("[Email] Missing credentials. Check GitHub Secrets.")
         return False
@@ -370,62 +418,87 @@ def send_radar_email(gif_bytes, games_data):
     try:
         latest = games_data[-1]
         oldest = games_data[0]
-        subject = f"🎯 Keno Survival Filter — Games #{oldest['game_id']} to #{latest['game_id']}"
+        final_lives = snapshots[-1]
 
-        # Count final survivors
-        survivors = games_data[0]["numbers"].copy()
-        for g in games_data[1:]:
-            survivors = survivors & g["numbers"]
-        survivor_list = "  ".join(str(n) for n in sorted(survivors)) if survivors else "None"
+        # Top survivors by life count
+        top_survivors = sorted(
+            [(n, final_lives[n]) for n in range(1, 81) if final_lives[n] > 0],
+            key=lambda x: x[1], reverse=True
+        )[:10]
+
+        survivor_rows = ""
+        for n, lv in top_survivors:
+            hearts = "♥" * min(lv, 8) + ("…" if lv > 8 else "")
+            color = "#00ffff" if lv >= 5 else "#aaaaff"
+            survivor_rows += f"""
+            <tr>
+              <td style="padding:4px 8px;font-size:16px;font-weight:bold;color:{color};">
+                {n}
+              </td>
+              <td style="padding:4px 8px;color:{color};font-family:monospace;">
+                {hearts}
+              </td>
+              <td style="padding:4px 8px;color:#aaaacc;font-size:13px;">
+                {lv} lives
+              </td>
+            </tr>"""
+
+        subject = f"🎯 Keno Life System — Games #{oldest['game_id']} to #{latest['game_id']}"
 
         html = f"""
         <html><body style="font-family:Arial,sans-serif;background:#060610;padding:20px;color:white;">
         <div style="max-width:650px;margin:auto;">
           <div style="background:#0f0f28;border-radius:8px;padding:24px;text-align:center;
-                      border:1px solid #00ddff44;">
-            <h1 style="color:#00ddff;margin:0;">🎯 Keno Survival Filter</h1>
+                      border:1px solid #4466ff44;">
+            <h1 style="color:#ffffff;margin:0;">🎯 Keno Life System</h1>
             <p style="color:#aaa;margin:8px 0;">GVR Green Game — Last 15 Draws</p>
           </div>
 
           <div style="background:#0d0d22;border-radius:8px;padding:16px;margin-top:16px;
                       border:1px solid #333355;">
-            <p style="color:#aaaacc;margin:0 0 8px;">
+            <p style="color:#aaaacc;margin:0 0 6px;">
               <strong style="color:white;">Game Range:</strong>
               #{oldest['game_id']} → #{latest['game_id']}
             </p>
-            <p style="color:#aaaacc;margin:0 0 8px;">
+            <p style="color:#aaaacc;margin:0 0 6px;">
               <strong style="color:white;">From:</strong> {oldest['timestamp']}
             </p>
-            <p style="color:#aaaacc;margin:0 0 8px;">
-              <strong style="color:white;">To:</strong> {latest['timestamp']}
-            </p>
             <p style="color:#aaaacc;margin:0;">
-              <strong style="color:#00ddff;">Final Survivors:</strong>
-              <span style="color:#00ffff;font-family:monospace;font-weight:bold;">
-                {survivor_list}
-              </span>
+              <strong style="color:white;">To:</strong> {latest['timestamp']}
             </p>
           </div>
 
           <div style="background:#0d0d22;border-radius:8px;padding:16px;margin-top:16px;
                       border:1px solid #333355;">
-            <h3 style="color:#00ddff;margin:0 0 10px;">How to Read the Filter</h3>
-            <p style="color:#aaa;font-size:13px;margin:0 0 8px;">
-              <strong style="color:white;">Frame 1:</strong> All 20 numbers from the oldest game light up white.
+            <h3 style="color:#ffffff;margin:0 0 12px;">
+              🏆 Final Standings — Top 10 Survivors
+            </h3>
+            <table style="width:100%;border-collapse:collapse;">
+              {survivor_rows}
+            </table>
+          </div>
+
+          <div style="background:#0d0d22;border-radius:8px;padding:16px;margin-top:16px;
+                      border:1px solid #333355;">
+            <h3 style="color:#ffffff;margin:0 0 10px;">How the Life System Works</h3>
+            <p style="color:#aaa;font-size:13px;margin:0 0 6px;">
+              Every number starts with <strong style="color:white;">2 lives</strong>.
             </p>
-            <p style="color:#aaa;font-size:13px;margin:0 0 8px;">
-              <strong style="color:white;">Each frame:</strong> The next game's 20 draws are overlaid.
-              Only numbers that appear in <em>both</em> this game and all previous games stay lit.
+            <p style="color:#aaa;font-size:13px;margin:0 0 6px;">
+              <strong style="color:#4488ff;">Drawn this game:</strong> +1 life. Gets bigger and brighter.
+            </p>
+            <p style="color:#aaa;font-size:13px;margin:0 0 6px;">
+              <strong style="color:#ff4444;">Not drawn:</strong> −1 life. Shrinks and dims.
             </p>
             <p style="color:#aaa;font-size:13px;margin:0;">
-              <strong style="color:#00ddff;">Cyan numbers</strong> have survived every game so far.
-              Watch the board empty out — the last numbers standing are the ones
-              that threaded through all 15 draws.
+              <strong style="color:#555566;">0 lives:</strong> Disappears from the board entirely.
+              Numbers that reach <strong style="color:#00ffff;">5+ lives</strong> blaze cyan with a glow.
             </p>
           </div>
 
           <p style="color:#444;font-size:11px;margin-top:16px;text-align:center;">
             Animated GIF attached. Open in any browser or image viewer.<br>
+            Life counts reset completely on each new trigger. Fresh start every time.<br>
             For analysis purposes only. Past draws do not predict future results.
           </p>
         </div>
@@ -443,7 +516,7 @@ def send_radar_email(gif_bytes, games_data):
         encoders.encode_base64(attachment)
         attachment.add_header(
             "Content-Disposition", "attachment",
-            filename=f"keno_survival_{oldest['game_id']}_to_{latest['game_id']}.gif"
+            filename=f"keno_life_{oldest['game_id']}_to_{latest['game_id']}.gif"
         )
         msg.attach(attachment)
 
@@ -452,7 +525,7 @@ def send_radar_email(gif_bytes, games_data):
             server.login(EMAIL_SENDER, EMAIL_PASSWORD)
             server.sendmail(EMAIL_SENDER, EMAIL_RECIPIENT, msg.as_string())
 
-        print(f"[Email] Survival filter sent to {EMAIL_RECIPIENT}.")
+        print(f"[Email] Life system results sent to {EMAIL_RECIPIENT}.")
         return True
 
     except Exception as e:
@@ -465,7 +538,7 @@ def send_radar_email(gif_bytes, games_data):
 # ==============================================================================
 def run_radar():
     print("\n" + "=" * 60)
-    print("[Radar] Starting Keno Survival Filter...")
+    print("[Radar] Starting Keno Life System...")
     print("=" * 60)
 
     if not os.path.exists(GAMES_FILE):
@@ -480,7 +553,8 @@ def run_radar():
         print(f"[Radar] Not enough games ({len(df)}). Need at least 2.")
         return
 
-    print(f"[Radar] Loaded {len(df)} games (#{df['Game ID'].iloc[0]} to #{df['Game ID'].iloc[-1]}).")
+    print(f"[Radar] Loaded {len(df)} games "
+          f"(#{df['Game ID'].iloc[0]} to #{df['Game ID'].iloc[-1]}).")
 
     games_data = []
     for _, row in df.iterrows():
@@ -496,8 +570,9 @@ def run_radar():
             "numbers": numbers,
         })
 
+    snapshots = simulate_lives(games_data)
     gif_bytes = generate_radar_gif(games_data)
-    send_radar_email(gif_bytes, games_data)
+    send_radar_email(gif_bytes, games_data, snapshots)
     print("\n[Radar] Complete.")
 
 
