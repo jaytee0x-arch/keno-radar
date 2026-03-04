@@ -264,9 +264,9 @@ def generate_frame(games_data, frame_idx, snapshots):
         y -= 0.095
 
     # Separator
-    ax_leg.axhline(y - 0.01, xmin=0.05, xmax=0.95,
-                   color="#1a1a3a", linewidth=0.8,
-                   transform=ax_leg.transAxes)
+    ax_leg.plot([0.05, 0.95], [y - 0.01, y - 0.01],
+                color="#1a1a3a", linewidth=0.8,
+                transform=ax_leg.transAxes)
 
     # Live stats
     ax_leg.text(
